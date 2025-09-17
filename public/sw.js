@@ -1,5 +1,12 @@
 // @ts-nocheck
 
+/**
+ * Verification Mode Flag
+ * Set to true to run the original /api/list request in parallel and compare the results.
+ * This is for testing and debugging purposes.
+ */
+const VERIFICATION_MODE = true;
+
 const CACHE_NAME = 'risuCache';
 const MERKLE_ROOT_KEY = 'merkle-root';
 const FILE_LIST_KEY = 'file-list';
@@ -8,12 +15,12 @@ const LEAF_TO_FILE_KEY_PREFIX = 'merkle-leaf-';
 
 /**
  * Fetches a URL with an authorization header if present.
- * @param {string} url The URL to fetch.
- * @param {Headers} headers The headers from the original request.
+ * @param {string | Request} url The URL to fetch.
+ * @param {Headers} [headers] The headers from the original request.
  * @returns {Promise<Response>}
  */
 async function fetchWithAuth(url, headers) {
-    const auth = headers.get('risu-auth');
+    const auth = headers ? headers.get('risu-auth') : undefined;
     const newHeaders = new Headers();
     if (auth) newHeaders.set('risu-auth', auth);
     return fetch(url, { headers: newHeaders });
@@ -55,7 +62,6 @@ async function synchronizeFiles(request) {
         if (fileListRes) return fileListRes;
     }
 
-    // Pre-cache the mapping from leaf hash to filename for all possible files.
     const allServerLeaves = await Promise.all(serverFiles.map(/** @param {string} file */ file => sha256(file)));
     for (let i = 0; i < allServerLeaves.length; i++) {
         await cache.put(new Request(LEAF_TO_FILE_KEY_PREFIX + allServerLeaves[i]), new Response(serverFiles[i]));
@@ -71,7 +77,6 @@ async function synchronizeFiles(request) {
     await cache.put(new Request(MERKLE_ROOT_KEY), new Response(serverRoot || ''));
     await cache.put(new Request(FILE_LIST_KEY), new Response(JSON.stringify(fileList), { headers: { 'Content-Type': 'application/json' } }));
 
-    // Cleanup stale cache entries
     const keys = await cache.keys();
     for (const key of keys) {
         const urlStr = key.url;
@@ -97,19 +102,16 @@ async function synchronizeFiles(request) {
 async function diffAndBuildFileList(localHash, remoteHash, headers, cache, activeCacheKeys) {
     if (!remoteHash) return [];
 
-    // Mark this hash as active for both potential node and leaf entries
     activeCacheKeys.add(new Request(NODE_KEY_PREFIX + remoteHash).url);
     activeCacheKeys.add(new Request(LEAF_TO_FILE_KEY_PREFIX + remoteHash).url);
 
     if (localHash === remoteHash) {
-        // Hashes match, subtree is identical. Reconstruct file list from cache.
         return await collectFilesFromCache(remoteHash, cache, activeCacheKeys);
     }
 
-    // Hashes differ. Fetch remote node's children.
     const remoteChildren = await fetchWithAuth(`/api/merkle/node/${remoteHash}`, headers).then(res => res.ok ? res.json() : null).catch(() => null);
 
-    if (!remoteChildren) { // It's a leaf node
+    if (!remoteChildren) {
         const fileRes = await cache.match(LEAF_TO_FILE_KEY_PREFIX + remoteHash);
         if (fileRes) {
             return [await fileRes.text()];
@@ -117,14 +119,13 @@ async function diffAndBuildFileList(localHash, remoteHash, headers, cache, activ
         return [];
     }
 
-    // It's an internal node. Cache it.
     await cache.put(new Request(NODE_KEY_PREFIX + remoteHash), new Response(JSON.stringify(remoteChildren)));
 
     const localChildren = await cache.match(NODE_KEY_PREFIX + localHash).then(res => res ? res.json() : null).catch(() => [null, null]);
 
     const leftFiles = await diffAndBuildFileList(localChildren[0], remoteChildren[0], headers, cache, activeCacheKeys);
     let rightFiles = [];
-    if (remoteChildren[0] !== remoteChildren[1]) { // Handle duplicates
+    if (remoteChildren[0] !== remoteChildren[1]) {
         rightFiles = await diffAndBuildFileList(localChildren[1], remoteChildren[1], headers, cache, activeCacheKeys);
     }
 
@@ -141,20 +142,19 @@ async function diffAndBuildFileList(localHash, remoteHash, headers, cache, activ
 async function collectFilesFromCache(hash, cache, activeCacheKeys) {
     if (!hash) return [];
 
-    // Mark this hash as active for both potential node and leaf entries
     activeCacheKeys.add(new Request(NODE_KEY_PREFIX + hash).url);
     activeCacheKeys.add(new Request(LEAF_TO_FILE_KEY_PREFIX + hash).url);
 
     const children = await cache.match(NODE_KEY_PREFIX + hash).then(res => res ? res.json() : null);
 
-    if (children) { // It's an internal node
+    if (children) {
         const leftFiles = await collectFilesFromCache(children[0], cache, activeCacheKeys);
         let rightFiles = [];
         if (children[0] !== children[1]) {
             rightFiles = await collectFilesFromCache(children[1], cache, activeCacheKeys);
         }
         return [...leftFiles, ...rightFiles];
-    } else { // It's a leaf
+    } else {
         const fileRes = await cache.match(LEAF_TO_FILE_KEY_PREFIX + hash);
         if (fileRes) {
             return [await fileRes.text()];
@@ -164,14 +164,71 @@ async function collectFilesFromCache(hash, cache, activeCacheKeys) {
 }
 
 /**
+ * Compares two arrays of strings for equality, ignoring order.
+ * @param {string[]} arr1
+ * @param {string[]} arr2
+ * @returns {boolean}
+ */
+function compareFileLists(arr1, arr2) {
+    if (arr1.length !== arr2.length) return false;
+    const sorted1 = [...arr1].sort();
+    const sorted2 = [...arr2].sort();
+    return sorted1.every((value, index) => value === sorted2[index]);
+}
+
+/**
+ * In verification mode, this function fetches the original list and compares it with the list from the Merkle sync.
+ * @param {Promise<Response>} merkleResponsePromise A promise that resolves to the response from the Merkle sync logic.
+ * @param {Request} originalRequest The original request object.
+ */
+async function verifySync(merkleResponsePromise, originalRequest) {
+    console.log('[VERIFY] Running verification...');
+    try {
+        const merkleResponse = await merkleResponsePromise;
+        const merkleData = await merkleResponse.clone().json();
+        const merkleFileList = merkleData.content;
+
+        const verificationUrl = new URL(originalRequest.url);
+        verificationUrl.searchParams.set('verify', 'true');
+        const verificationRequest = new Request(verificationUrl, originalRequest);
+
+        const originalResponse = await fetch(verificationRequest);
+        const originalData = await originalResponse.json();
+        const originalFileList = originalData.content;
+
+        if (compareFileLists(merkleFileList, originalFileList)) {
+            console.log('%c[VERIFY] SUCCESS: Merkle tree sync result matches original request.', 'color: green; font-weight: bold;');
+        } else {
+            console.error('[VERIFY] FAILURE: Mismatch between Merkle tree sync and original request.');
+            console.log('[VERIFY] Merkle List:', merkleFileList);
+            console.log('[VERIFY] Original List:', originalFileList);
+        }
+    } catch (err) {
+        console.error('[VERIFY] Error during verification:', err);
+    }
+}
+
+/**
  * @param {FetchEvent} event
  */
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
+
     if (url.pathname === '/api/list') {
-        event.respondWith(synchronizeFiles(event.request));
+        if (url.searchParams.has('verify')) {
+            event.respondWith(fetch(event.request));
+            return;
+        }
+
+        const responsePromise = synchronizeFiles(event.request);
+        event.respondWith(responsePromise);
+
+        if (VERIFICATION_MODE) {
+            event.waitUntil(verifySync(responsePromise, event.request));
+        }
         return;
     }
+
     const path = url.pathname.split('/');
     if (path[1] === 'sw') {
         try {
