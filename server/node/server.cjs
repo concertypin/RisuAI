@@ -5,6 +5,73 @@ const htmlparser = require('node-html-parser');
 const { existsSync, mkdirSync, readFileSync, writeFileSync } = require('fs');
 const fs = require('fs/promises')
 const crypto = require('crypto')
+
+/**
+ * @typedef {object} MerkleTree
+ * @property {string} root
+ * @property {string[]} leaves
+ * @property {string[]} files
+ */
+
+/**
+ * Calculates the SHA256 hash of a string.
+ * @param {string} data The string to hash.
+ * @returns {string} The hex-encoded hash.
+ */
+function sha256(data) {
+    return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+// Simple Merkle Tree Implementation
+/** @type {MerkleTree | null} */
+let merkleTree = null;
+/** @type {string[]} */
+let fileList = [];
+/** @type {Object.<string, [string, string]>} */
+const nodes = {};
+
+/**
+ * Builds the Merkle tree from the files in the save directory.
+ * @returns {Promise<void>}
+ */
+async function buildMerkleTree() {
+    console.log('[Merkle] Building tree...');
+    Object.keys(nodes).forEach(key => delete nodes[key]);
+    const files = await fs.readdir(path.join(savePath));
+    const newFileList = files.map((v) => Buffer.from(v, 'hex').toString('utf-8')).sort();
+
+    const leaves = newFileList.map(sha256);
+
+    if (leaves.length === 0) {
+        merkleTree = null;
+        fileList = [];
+        return;
+    }
+
+    /**
+     * Recursively builds the Merkle tree.
+     * @param {string[]} leaves The leaves to build the tree from.
+     * @returns {string} The root of the tree.
+     */
+    const build = (leaves) => {
+        if (leaves.length === 1) return leaves[0];
+        const parents = [];
+        for (let i = 0; i < leaves.length; i += 2) {
+            const left = leaves[i];
+            const right = (i + 1 < leaves.length) ? leaves[i + 1] : left;
+            const parent = sha256(left + right);
+            nodes[parent] = [left, right];
+            parents.push(parent);
+        }
+        return build(parents);
+    };
+    const root = build(leaves);
+
+    merkleTree = { root, leaves, files: newFileList };
+    fileList = newFileList;
+    console.log('[Merkle] Tree built successfully. Root:', merkleTree ? merkleTree.root : null);
+}
+
 app.use(express.static(path.join(process.cwd(), 'dist'), {index: false}));
 app.use(express.json({ limit: '100mb' }));
 app.use(express.raw({ type: 'application/octet-stream', limit: '100mb' }));
@@ -26,10 +93,20 @@ if(existsSync(passwordPath)){
     password = readFileSync(passwordPath, 'utf-8')
 }
 const hexRegex = /^[0-9a-fA-F]+$/;
+/**
+ * Checks if a string is a valid hex string.
+ * @param {string} str The string to check.
+ * @returns {boolean}
+ */
 function isHex(str) {
     return hexRegex.test(str.toUpperCase().trim()) || str === '__password';
 }
 
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ * @param {express.NextFunction} next
+ */
 app.get('/', async (req, res, next) => {
 
     const clientIP = req.headers['x-forwarded-for'] || req.ip || req.socket.remoteAddress || 'Unknown IP';
@@ -38,7 +115,7 @@ app.get('/', async (req, res, next) => {
     
     try {
         const mainIndex = await fs.readFile(path.join(process.cwd(), 'dist', 'index.html'))
-        const root = htmlparser.parse(mainIndex)
+        const root = htmlparser.parse(mainIndex.toString())
         const head = root.querySelector('head')
         head.innerHTML = `<script>globalThis.__NODE__ = true</script>` + head.innerHTML
         
@@ -49,9 +126,14 @@ app.get('/', async (req, res, next) => {
     }
 })
 
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ * @param {express.NextFunction} next
+ */
 const reverseProxyFunc = async (req, res, next) => {
-    const authHeader = req.headers['risu-auth'];
-    if(!authHeader || authHeader.trim() !== password.trim()){
+    const authHeader = req.headers['risu-auth'] || '';
+    if(authHeader.trim() !== password.trim()){
         console.log('incorrect', 'received:', authHeader, 'expected:', password)
         res.status(400).send({
             error:'Password Incorrect'
@@ -59,7 +141,7 @@ const reverseProxyFunc = async (req, res, next) => {
         return
     }
     
-    const urlParam = req.headers['risu-url'] ? decodeURIComponent(req.headers['risu-url']) : req.query.url;
+    const urlParam = req.headers['risu-url'] ? decodeURIComponent(/** @type {string} */ (req.headers['risu-url'])) : req.query.url;
 
     if (!urlParam) {
         res.status(400).send({
@@ -67,14 +149,14 @@ const reverseProxyFunc = async (req, res, next) => {
         });
         return;
     }
-    const header = req.headers['risu-header'] ? JSON.parse(decodeURIComponent(req.headers['risu-header'])) : req.headers;
+    const header = req.headers['risu-header'] ? JSON.parse(decodeURIComponent(/** @type {string} */ (req.headers['risu-header']))) : req.headers;
     if(!header['x-forwarded-for']){
         header['x-forwarded-for'] = req.ip
     }
     let originalResponse;
     try {
         // make request to original server
-        originalResponse = await fetch(urlParam, {
+        originalResponse = await fetch(/** @type {string} */ (urlParam), {
             method: req.method,
             headers: header,
             body: JSON.stringify(req.body)
@@ -97,7 +179,7 @@ const reverseProxyFunc = async (req, res, next) => {
         // send response status to client
         res.status(originalResponse.status);
         // send response body to client
-        await pipeline(originalResponse.body, res);
+        await pipeline(/** @type {NodeJS.ReadableStream} */ (originalBody), res);
 
 
     }
@@ -107,9 +189,14 @@ const reverseProxyFunc = async (req, res, next) => {
     }
 }
 
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ * @param {express.NextFunction} next
+ */
 const reverseProxyFunc_get = async (req, res, next) => {
-    const authHeader = req.headers['risu-auth'];
-    if(!authHeader || authHeader.trim() !== password.trim()){
+    const authHeader = req.headers['risu-auth'] || '';
+    if(authHeader.trim() !== password.trim()){
         console.log('incorrect', 'received:', authHeader, 'expected:', password)
         res.status(400).send({
             error:'Password Incorrect'
@@ -117,7 +204,7 @@ const reverseProxyFunc_get = async (req, res, next) => {
         return
     }
     
-    const urlParam = req.headers['risu-url'] ? decodeURIComponent(req.headers['risu-url']) : req.query.url;
+    const urlParam = req.headers['risu-url'] ? decodeURIComponent(/** @type {string} */ (req.headers['risu-url'])) : req.query.url;
 
     if (!urlParam) {
         res.status(400).send({
@@ -125,14 +212,14 @@ const reverseProxyFunc_get = async (req, res, next) => {
         });
         return;
     }
-    const header = req.headers['risu-header'] ? JSON.parse(decodeURIComponent(req.headers['risu-header'])) : req.headers;
+    const header = req.headers['risu-header'] ? JSON.parse(decodeURIComponent(/** @type {string} */ (req.headers['risu-header']))) : req.headers;
     if(!header['x-forwarded-for']){
         header['x-forwarded-for'] = req.ip
     }
     let originalResponse;
     try {
         // make request to original server
-        originalResponse = await fetch(urlParam, {
+        originalResponse = await fetch(/** @type {string} */(urlParam), {
             method: 'GET',
             headers: header
         });
@@ -154,7 +241,7 @@ const reverseProxyFunc_get = async (req, res, next) => {
         // send response status to client
         res.status(originalResponse.status);
         // send response body to client
-        await pipeline(originalResponse.body, res);
+        await pipeline(/** @type {NodeJS.ReadableStream} */ (originalBody), res);
     }
     catch (err) {
         next(err);
@@ -162,6 +249,10 @@ const reverseProxyFunc_get = async (req, res, next) => {
     }
 }
 
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ */
 async function hubProxyFunc(req, res) {
     const excludedHeaders = [
         'content-encoding',
@@ -186,6 +277,7 @@ async function hubProxyFunc(req, res) {
             headers: headersToSend,
             body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
             redirect: 'manual',
+            // @ts-ignore
             duplex: 'half'
         });
         
@@ -206,6 +298,7 @@ async function hubProxyFunc(req, res) {
                 headers: newHeaders,
                 body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
                 redirect: 'manual',
+                // @ts-ignore
                 duplex: 'half'
             });
             for (const [key, value] of redirectResponse.headers.entries()) {
@@ -215,11 +308,11 @@ async function hubProxyFunc(req, res) {
                 res.setHeader(key, value);
             }
             res.status(redirectResponse.status);
-            await pipeline(redirectResponse.body, res);
+            await pipeline(/** @type {NodeJS.ReadableStream} */ (redirectResponse.body), res);
             return;
         }
         
-        await pipeline(response.body, res);
+        await pipeline(/** @type {NodeJS.ReadableStream} */ (response.body), res);
         
     } catch (error) {
         console.error("[Hub Proxy] Error:", error);
@@ -239,6 +332,10 @@ app.post('/proxy', reverseProxyFunc);
 app.post('/proxy2', reverseProxyFunc);
 app.post('/hub-proxy/*', hubProxyFunc);
 
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ */
 app.get('/api/password', async(req, res)=> {
     if(password === ''){
         res.send({status: 'unset'})
@@ -251,7 +348,12 @@ app.get('/api/password', async(req, res)=> {
     }
 })
 
-app.post('/api/crypto', async (req, res) => {
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ * @param {express.NextFunction} next
+ */
+app.post('/api/crypto', async (req, res, next) => {
     try {
         const hash = crypto.createHash('sha256')
         hash.update(Buffer.from(req.body.data, 'utf-8'))
@@ -261,7 +363,10 @@ app.post('/api/crypto', async (req, res) => {
     }
 })
 
-
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ */
 app.post('/api/set_password', async (req, res) => {
     if(password === ''){
         password = req.body.password
@@ -270,8 +375,13 @@ app.post('/api/set_password', async (req, res) => {
     res.status(400).send("already set")
 })
 
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ * @param {express.NextFunction} next
+ */
 app.get('/api/read', async (req, res, next) => {
-    if(req.headers['risu-auth'].trim() !== password.trim()){
+    if((req.headers['risu-auth'] || '').trim() !== password.trim()){
         console.log('incorrect')
         res.status(400).send({
             error:'Password Incorrect'
@@ -279,7 +389,7 @@ app.get('/api/read', async (req, res, next) => {
         return
     }
     const filePath = req.headers['file-path'];
-    if (!filePath) {
+    if (!filePath || typeof filePath !== 'string') {
         console.log('no path')
         res.status(400).send({
             error:'File path required'
@@ -306,8 +416,13 @@ app.get('/api/read', async (req, res, next) => {
     }
 });
 
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ * @param {express.NextFunction} next
+ */
 app.get('/api/remove', async (req, res, next) => {
-    if(req.headers['risu-auth'].trim() !== password.trim()){
+    if((req.headers['risu-auth'] || '').trim() !== password.trim()){
         console.log('incorrect')
         res.status(400).send({
             error:'Password Incorrect'
@@ -315,7 +430,7 @@ app.get('/api/remove', async (req, res, next) => {
         return
     }
     const filePath = req.headers['file-path'];
-    if (!filePath) {
+    if (!filePath || typeof filePath !== 'string') {
         res.status(400).send({
             error:'File path required'
         });
@@ -330,6 +445,7 @@ app.get('/api/remove', async (req, res, next) => {
 
     try {
         await fs.rm(path.join(savePath, filePath));
+        await buildMerkleTree();
         res.send({
             success: true,
         });
@@ -338,8 +454,52 @@ app.get('/api/remove', async (req, res, next) => {
     }
 });
 
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ * @param {express.NextFunction} next
+ */
+app.get('/api/merkle/root', async (req, res, next) => {
+    if((req.headers['risu-auth'] || '').trim() !== password.trim()){
+        res.status(400).send({ error:'Password Incorrect' });
+        return;
+    }
+    try {
+        if (!merkleTree) {
+            res.send({ root: null, files: [] });
+            return;
+        }
+        res.send({ root: merkleTree.root, files: merkleTree.files });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ * @param {express.NextFunction} next
+ */
+app.get('/api/merkle/node/:hash', async (req, res, next) => {
+    if((req.headers['risu-auth'] || '').trim() !== password.trim()){
+        res.status(400).send({ error:'Password Incorrect' });
+        return;
+    }
+    const { hash } = req.params;
+    if (nodes[hash]) {
+        res.send(nodes[hash]);
+    } else {
+        res.status(404).send({ error: 'Node not found' });
+    }
+});
+
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ * @param {express.NextFunction} next
+ */
 app.get('/api/list', async (req, res, next) => {
-    if(req.headers['risu-auth'].trim() !== password.trim()){
+    if((req.headers['risu-auth'] || '').trim() !== password.trim()){
         console.log('incorrect')
         res.status(400).send({
             error:'Password Incorrect'
@@ -359,8 +519,13 @@ app.get('/api/list', async (req, res, next) => {
     }
 });
 
+/**
+ * @param {express.Request} req
+ * @param {express.Response} res
+ * @param {express.NextFunction} next
+ */
 app.post('/api/write', async (req, res, next) => {
-    if(req.headers['risu-auth'].trim() !== password.trim()){
+    if((req.headers['risu-auth'] || '').trim() !== password.trim()){
         console.log('incorrect')
         res.status(400).send({
             error:'Password Incorrect'
@@ -369,9 +534,9 @@ app.post('/api/write', async (req, res, next) => {
     }
     const filePath = req.headers['file-path'];
     const fileContent = req.body
-    if (!filePath || !fileContent) {
+    if (!filePath || typeof filePath !== 'string' || !fileContent) {
         res.status(400).send({
-            error:'File path required'
+            error:'File path and content are required'
         });
         return;
     }
@@ -384,6 +549,7 @@ app.post('/api/write', async (req, res, next) => {
 
     try {
         await fs.writeFile(path.join(savePath, filePath), fileContent);
+        await buildMerkleTree();
         res.send({
             success: true
         });
@@ -392,6 +558,9 @@ app.post('/api/write', async (req, res, next) => {
     }
 });
 
+/**
+ * @returns {Promise<{key: Buffer, cert: Buffer} | null>}
+ */
 async function getHttpsOptions() {
 
     const keyPath = path.join(sslPath, 'server.key');
@@ -416,6 +585,9 @@ async function getHttpsOptions() {
     }
 }
 
+/**
+ * @returns {Promise<void>}
+ */
 async function startServer() {
     try {
       
@@ -442,5 +614,6 @@ async function startServer() {
 }
 
 (async () => {
+    await buildMerkleTree();
     await startServer();
 })();
