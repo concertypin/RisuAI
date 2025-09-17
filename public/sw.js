@@ -44,50 +44,56 @@ async function sha256(str) {
  */
 async function synchronizeFiles(request) {
     const cache = await caches.open(CACHE_NAME);
-    const localRootRes = await cache.match(MERKLE_ROOT_KEY);
-    const localRoot = localRootRes ? await localRootRes.text() : null;
+    try {
+        const localRootRes = await cache.match(MERKLE_ROOT_KEY);
+        const localRoot = localRootRes ? await localRootRes.text() : null;
 
-    const serverRes = await fetchWithAuth('/api/merkle/root', request.headers).catch(() => null);
+        const serverRes = await fetchWithAuth('/api/merkle/root', request.headers);
 
-    if (!serverRes || !serverRes.ok) {
-        const cachedList = await cache.match(FILE_LIST_KEY);
-        if (cachedList) return cachedList;
-        return new Response(JSON.stringify({ success: false, content: [] }), { status: 500 });
-    }
+        if (!serverRes.ok) {
+            throw new Error(`Failed to fetch Merkle root: ${serverRes.statusText}`);
+        }
 
-    const { root: serverRoot, files: serverFiles } = await serverRes.json();
+        const { root: serverRoot, files: serverFiles } = await serverRes.json();
 
-    if (localRoot === serverRoot) {
-        const fileListRes = await cache.match(FILE_LIST_KEY);
-        if (fileListRes) return fileListRes;
-    }
+        if (localRoot === serverRoot) {
+            const fileListRes = await cache.match(FILE_LIST_KEY);
+            if (fileListRes) return fileListRes;
+        }
 
-    const allServerLeaves = await Promise.all(serverFiles.map(/** @param {string} file */ file => sha256(file)));
-    for (let i = 0; i < allServerLeaves.length; i++) {
-        await cache.put(new Request(LEAF_TO_FILE_KEY_PREFIX + allServerLeaves[i]), new Response(serverFiles[i]));
-    }
+        const allServerLeaves = await Promise.all(serverFiles.map(/** @param {string} file */ file => sha256(file)));
+        for (let i = 0; i < allServerLeaves.length; i++) {
+            await cache.put(new Request(LEAF_TO_FILE_KEY_PREFIX + allServerLeaves[i]), new Response(serverFiles[i]));
+        }
 
-    const activeCacheKeys = new Set([
-        new Request(MERKLE_ROOT_KEY).url,
-        new Request(FILE_LIST_KEY).url,
-    ]);
+        const activeCacheKeys = new Set([
+            new Request(MERKLE_ROOT_KEY).url,
+            new Request(FILE_LIST_KEY).url,
+        ]);
 
-    const fileList = await diffAndBuildFileList(localRoot, serverRoot, request.headers, cache, activeCacheKeys);
+        const fileList = await diffAndBuildFileList(localRoot, serverRoot, request.headers, cache, activeCacheKeys);
 
-    await cache.put(new Request(MERKLE_ROOT_KEY), new Response(serverRoot || ''));
-    await cache.put(new Request(FILE_LIST_KEY), new Response(JSON.stringify(fileList), { headers: { 'Content-Type': 'application/json' } }));
+        await cache.put(new Request(MERKLE_ROOT_KEY), new Response(serverRoot || ''));
+        await cache.put(new Request(FILE_LIST_KEY), new Response(JSON.stringify(fileList), { headers: { 'Content-Type': 'application/json' } }));
 
-    const keys = await cache.keys();
-    for (const key of keys) {
-        const urlStr = key.url;
-        if (urlStr.includes(NODE_KEY_PREFIX) || urlStr.includes(LEAF_TO_FILE_KEY_PREFIX)) {
-            if (!activeCacheKeys.has(urlStr)) {
-                 await cache.delete(key);
+        const keys = await cache.keys();
+        for (const key of keys) {
+            const urlStr = key.url;
+            if (urlStr.includes(NODE_KEY_PREFIX) || urlStr.includes(LEAF_TO_FILE_KEY_PREFIX)) {
+                if (!activeCacheKeys.has(urlStr)) {
+                     await cache.delete(key);
+                }
             }
         }
-    }
 
-    return new Response(JSON.stringify({ success: true, content: fileList }), { headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ success: true, content: fileList }), { headers: { 'Content-Type': 'application/json' } });
+
+    } catch (error) {
+        console.error('[Merkle Sync] Failed to synchronize files. Falling back to cache.', error);
+        const cachedList = await cache.match(FILE_LIST_KEY);
+        if (cachedList) return cachedList;
+        return new Response(JSON.stringify({ success: false, content: [], error: 'Sync failed and no cache available.' }), { status: 500 });
+    }
 }
 
 /**
@@ -109,9 +115,13 @@ async function diffAndBuildFileList(localHash, remoteHash, headers, cache, activ
         return await collectFilesFromCache(remoteHash, cache, activeCacheKeys);
     }
 
-    const remoteChildren = await fetchWithAuth(`/api/merkle/node/${remoteHash}`, headers).then(res => res.ok ? res.json() : null).catch(() => null);
+    const remoteChildrenRes = await fetchWithAuth(`/api/merkle/node/${remoteHash}`, headers);
+    if (!remoteChildrenRes.ok) {
+        throw new Error(`[Merkle Sync] Server error fetching node ${remoteHash}: ${remoteChildrenRes.statusText}`);
+    }
+    const remoteChildren = await remoteChildrenRes.json().catch(() => null);
 
-    if (!remoteChildren) {
+    if (!remoteChildren) { // It's a leaf node
         const fileRes = await cache.match(LEAF_TO_FILE_KEY_PREFIX + remoteHash);
         if (fileRes) {
             return [await fileRes.text()];
@@ -170,6 +180,7 @@ async function collectFilesFromCache(hash, cache, activeCacheKeys) {
  * @returns {boolean}
  */
 function compareFileLists(arr1, arr2) {
+    if (!arr1 || !arr2) return false;
     if (arr1.length !== arr2.length) return false;
     const sorted1 = [...arr1].sort();
     const sorted2 = [...arr2].sort();
@@ -186,6 +197,11 @@ async function verifySync(merkleResponsePromise, originalRequest) {
     try {
         const merkleResponse = await merkleResponsePromise;
         const merkleData = await merkleResponse.clone().json();
+
+        if (!merkleData.success) {
+            console.error('[VERIFY] Merkle sync failed, skipping verification.');
+            return;
+        }
         const merkleFileList = merkleData.content;
 
         const verificationUrl = new URL(originalRequest.url);
@@ -216,6 +232,8 @@ self.addEventListener('fetch', (event) => {
 
     if (url.pathname === '/api/list') {
         if (url.searchParams.has('verify')) {
+            // This is a verification request, pass it through to the network directly.
+            // We do not use fetchWithAuth here to avoid any potential loops if that function changes.
             event.respondWith(fetch(event.request));
             return;
         }
